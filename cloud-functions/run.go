@@ -16,7 +16,8 @@ import (
 
 var (
 	mu        sync.Mutex
-	isRunning bool
+	// isRunning bool
+	activeCmd *exec.Cmd
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -43,43 +44,48 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		log.Println("[INFO] 检测到文件已存在，跳过下载环节。")
 	}
 
-	// 2. 进程状态检测与启动
-	mu.Lock()
-	if !isRunning {
-		log.Println("[INFO] 程序未运行，准备启动 vltrig...")
-		
-		// 【修改点 2 & 3】：带上配置文件参数，并指定工作目录
-		cmd := exec.Command(binPath, "-c", configPath)
-		cmd.Dir = "/tmp" // 指定运行目录为 /tmp，防止程序在只读区写日志报错
-		
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
 
-		if err := cmd.Start(); err != nil {
-			mu.Unlock()
-			log.Printf("[ERROR] 启动二进制程序失败: %v\n", err)
-			http.Error(w, "启动程序失败: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		
-		isRunning = true
-		log.Printf("[INFO] vltrig 启动成功，PID: %d\n", cmd.Process.Pid)
-		
-		// 监控协程
-		go func(c *exec.Cmd) {
-			err := c.Wait()
-			mu.Lock()
-			isRunning = false
-			mu.Unlock()
-			if err != nil {
-				log.Printf("[WARN] vltrig 进程退出，伴随错误: %v\n", err)
-			} else {
-				log.Println("[INFO] vltrig 进程正常执行完毕退出。")
-			}
-		}(cmd)
-	} else {
-		log.Println("[INFO] 程序已在运行中，跳过启动环节。")
+	// 2. 进程清理与重新启动 (杀旧启新)
+	// ==========================================
+	mu.Lock()
+	
+	// 如果发现有残留的旧进程，直接强制杀掉
+	if activeCmd != nil && activeCmd.Process != nil {
+		log.Println("[INFO] 发现热启动残留的旧进程，正在强制终止...")
+		// 杀掉旧进程，这样就不会占用 CPU 和端口
+		activeCmd.Process.Kill() 
+		activeCmd = nil
+		// 给系统一点点时间回收进程资源
+		time.Sleep(500 * time.Millisecond)
 	}
+
+	log.Println("[INFO] 准备启动全新的 vltrig 进程...")
+	cmd := exec.Command(binPath, "-c", configPath)
+	cmd.Dir = "/tmp" 
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		mu.Unlock()
+		log.Printf("[ERROR] 启动二进制程序失败: %v\n", err)
+		http.Error(w, "启动程序失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	// 把新启动的进程记录下来，留给下一次请求时清理
+	activeCmd = cmd 
+	log.Printf("[INFO] 全新 vltrig 启动成功，PID: %d\n", cmd.Process.Pid)
+	
+	// 监控与僵尸进程回收协程
+	go func(c *exec.Cmd) {
+		err := c.Wait() // 阻塞等待。当我们调用 Kill() 时，这里会立即解除阻塞
+		if err != nil {
+			log.Printf("[WARN] 进程结束/被强制终止 (PID %d): %v\n", c.Process.Pid, err)
+		} else {
+			log.Printf("[INFO] 进程正常退出 (PID %d)\n", c.Process.Pid)
+		}
+	}(cmd)
+	
 	mu.Unlock()
 
 	// 3. 挂起等待
